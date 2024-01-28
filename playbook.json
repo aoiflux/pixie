@@ -1,0 +1,28 @@
+{
+    "meta": {
+        "name": "network catcher",
+        "description": "",
+        "version": 0,
+        "author": "desmond"
+    },
+    "actions": [
+        {
+            "scans": [
+                "scan1"
+            ],
+            "files": [
+                "file1"
+            ],
+            "ftype": ""
+        }
+    ],
+    "inference": {
+        "wordlist": [
+            "word1"
+        ],
+        "blacklist": [
+            "black1"
+        ],
+        "time_deviation": 0
+    }
+}
