@@ -191,8 +191,8 @@ def commonality():
         if WIN_PSSCAN in fname:
             common_report(fname, "processes.json", "ImageFileName")
         if WIN_NETSCAN in fname:
-            common_conns(fname, "conns.json", "LocalAddr")
-            common_conns(fname, "conns.json", "ForeignAddr")
+            common_report(fname, "conns.json", "LocalAddr")
+            common_report(fname, "conns.json", "ForeignAddr")
         if "conns"+SEP in fname:
             common_conns(fname, "conns.json")
         if ".pcap." in fname:
@@ -204,9 +204,18 @@ def common_files(fname:str, rname:str):
     fname = fname.split(SEP)[-1]
     fname = fname.split(".json")[0]
 
-    fh = open(fpath)
-    dd_fmap = json.load(fh)
-    fh.close()
+    if not os.path.exists(fpath):
+        return
+    if os.path.getsize(fpath) == 0:
+        return
+
+    dd_fmap = {}
+    try:
+        fh = open(fpath)
+        dd_fmap = json.load(fh)
+        fh.close()
+    except:
+        return
 
     fmap = {}
     fpath = os.path.join(OUTDIR, rname)
@@ -275,9 +284,18 @@ def common_conns(fname:str, rname:str):
     fname = fname.split(SEP)[-1]
     fname = fname.split(".json")[0]
 
-    fh = open(fpath)
-    flist = json.load(fh)
-    fh.close()
+    if not os.path.exists(fpath):
+        return
+    if os.path.getsize(fpath) == 0:
+        return
+
+    flist = []
+    try:
+        fh = open(fpath)
+        flist = json.load(fh)
+        fh.close()
+    except:
+        return
 
     fmap = {}
     fpath = os.path.join(OUTDIR, rname)
@@ -303,9 +321,18 @@ def common_report(fname:str, rname:str, skey:str):
     fname = fname.split(SEP)[-1]
     fname = fname.split(".json")[0]
 
-    fh = open(fpath)
-    flmap = json.load(fh)
-    fh.close()
+    if not os.path.exists(fpath):
+        return
+    if os.path.getsize(fpath) == 0:
+        return
+
+    flmap = {}
+    try:
+        fh = open(fpath)
+        flmap = json.load(fh)
+        fh.close()
+    except:
+        return
 
     fmap = {}
     fpath = os.path.join(OUTDIR, rname)
