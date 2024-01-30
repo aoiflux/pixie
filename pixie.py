@@ -22,7 +22,7 @@ WIN_NETSCAN = WINDOWS+"netscan"
 WIN_DLLLIST = WINDOWS+"dlllist"
 OUTDIR = "data"
 ERRDIR = "err"
-SEP = "_I_"
+SEP = "_T_"
 
 def scan_files(indir:str):
     actions = [
