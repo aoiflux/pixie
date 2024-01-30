@@ -1,6 +1,5 @@
 from volatility3.cli import CommandLine
 from thefuzz import fuzz
-from typing import List
 from re import Pattern
 import multiprocessing
 import datetime
