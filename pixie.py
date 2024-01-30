@@ -443,7 +443,7 @@ def get_rels()-> list[psreport.Relation]:
             rel.proc_name = str(ps["ImageFileName"])
             rel.create_time = str(ps["CreateTime"])
             rel.evi = fname
-            rel.confidence = 0
+            rel.confidence = 100
             rel.actual_deviation = 0
             rel.dll = []
 
