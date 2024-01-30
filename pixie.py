@@ -7,9 +7,9 @@ import datetime
 import playbook
 import psreport
 import datetime
-import pyshark
 import signal
 import pytsk3
+import dpkt
 import glob
 import json
 import sys
@@ -118,19 +118,19 @@ def scan_mem_subproc(indir:str, fname:str, action:str):
 def scan_pcap(indir:str, fname:str):
     iplist = []
     fpath = os.path.join(indir, fname)
-    packets = pyshark.FileCapture(fpath, only_summaries=False, keep_packets=False)
-    for packet in packets:
-        if 'IP' in packet:
-            src_ip = packet.ip.src
-            dst_ip = packet.ip.dst
+    fh = open(fpath, "rb")
+    packets = dpkt.pcap.Reader(fh)
 
-            src_port, dst_port = None, None
-            if 'TCP' in packet:
-                src_port = packet.tcp.srcport
-                dst_port = packet.tcp.dstport
-            elif 'UDP' in packet:
-                src_port = packet.udp.srcport
-                dst_port = packet.udp.dstport
+    for _, buf in packets:
+        eth = dpkt.ethernet.Ethernet(buf)
+        ip = eth.data
+
+        src_ip = dpkt.utils.inet_to_str(ip.src)
+        dst_ip = dpkt.utils.inet_to_str(ip.dst)
+
+        if isinstance(ip, dpkt.ip.IP):
+            src_port = ip.data.sport
+            dst_port = ip.data.dport
 
             iplist.append({'src': src_ip, 'dst': dst_ip, 'src_port': src_port, 'dst_port': dst_port})
 

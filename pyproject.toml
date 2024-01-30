@@ -9,11 +9,11 @@ readme = "README.md"
 python = "^3.12"
 pytsk3 = "^20231007"
 volatility3 = "^2.5.0"
-pyshark = "^0.6"
 capstone = "^5.0.1"
 setup-utils = "^0.2.0"
 pydantic = "^2.6.0"
 thefuzz = "^0.22.1"
+dpkt = "^1.9.8"
 
 
 [build-system]
