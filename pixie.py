@@ -40,7 +40,7 @@ def scan_files(indir:str):
                     get_conns(indir, fname)
                     for action in actions:
                         scan_memory(indir, fname, action)
-                case "pcap":
+                case packet if packet in ["pcap", "pcapng"]:
                     scan_pcap(indir, fname)
                 case disk if disk in ["dd", "001", "raw"]:
                     scan_disk(indir, fname)
