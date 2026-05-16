@@ -1,6 +1,6 @@
-from pydantic import BaseModel
-from typing import List
 import json
+from pydantic import BaseModel
+
 
 class Meta(BaseModel):
     name: str
@@ -8,24 +8,32 @@ class Meta(BaseModel):
     version: int
     author: str
 
+
 class Action(BaseModel):
-    scans: List[str]
-    files: List[str]
+    scans: list[str]
+    files: list[str]
     ftype: str
 
+
 class Inference(BaseModel):
-    wordlist: List[str]
-    blacklist: List[str]
+    wordlist: list[str]
+    blacklist: list[str]
     time_deviation: int
+
 
 class Playbook(BaseModel):
     meta: Meta
-    actions: List[Action]
+    actions: list[Action]
     inference: Inference
 
 
-def NewPlaybook(fpath) -> Playbook:
-    fp = open(fpath)
-    jdata = json.load(fp)
-    fp.close()
+def new_playbook(fpath: str) -> Playbook:
+    """Load and validate playbook json from disk."""
+    with open(fpath, "r", encoding="utf-8") as fp:
+        jdata = json.load(fp)
     return Playbook(**jdata)
+
+
+def NewPlaybook(fpath: str) -> Playbook:
+    """Backward-compatible wrapper for legacy callers."""
+    return new_playbook(fpath)

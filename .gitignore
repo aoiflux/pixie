@@ -162,3 +162,8 @@ cython_debug/
 # devdata
 /data/*
 /err/*
+
+pixie.dist/*
+pixie.bin
+Pipfile
+Pipfile.lock

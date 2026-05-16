@@ -15,6 +15,14 @@ pydantic = "^2.6.0"
 thefuzz = "^0.22.1"
 dpkt = "^1.9.8"
 
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests that require external artifacts and real tool execution",
+]
+
 
 [build-system]
 requires = ["poetry-core"]
