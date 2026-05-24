@@ -17,17 +17,6 @@ def _install_dependency_stubs() -> None:
         sys.modules["volatility3"] = volatility3
         sys.modules["volatility3.cli"] = cli
 
-    if "thefuzz" not in sys.modules:
-        thefuzz = types.ModuleType("thefuzz")
-
-        class _Fuzz:
-            @staticmethod
-            def ratio(a, b) -> int:
-                return 100 if str(a).lower() == str(b).lower() else 0
-
-        thefuzz.fuzz = _Fuzz()
-        sys.modules["thefuzz"] = thefuzz
-
     if "pytsk3" not in sys.modules:
         pytsk3 = types.ModuleType("pytsk3")
         pytsk3.TSK_FS_META_TYPE_DIR = 1

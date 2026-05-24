@@ -14,9 +14,6 @@ def test_scan_files_best_effort_continues_after_failure(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_get_conns(indir, fname):
-        calls.append(("get_conns", fname))
-
     def fake_scan_memory(indir, fname, action):
         calls.append(("scan_memory", fname, action))
         if fname == "a.mem" and action == pixie.WIN_FILESCAN:
@@ -28,7 +25,6 @@ def test_scan_files_best_effort_continues_after_failure(tmp_path, monkeypatch):
     def fake_scan_disk(indir, fname):
         calls.append(("scan_disk", fname))
 
-    monkeypatch.setattr(pixie, "get_conns", fake_get_conns)
     monkeypatch.setattr(pixie, "scan_memory", fake_scan_memory)
     monkeypatch.setattr(pixie, "scan_pcap", fake_scan_pcap)
     monkeypatch.setattr(pixie, "scan_disk", fake_scan_disk)
@@ -67,110 +63,20 @@ def test_parse_timestamp_supports_common_formats():
     assert pixie.parse_timestamp("not-a-time") is None
 
 
-def test_ps_match_generates_expected_output(tmp_path, monkeypatch):
-    pixie = import_pixie_module()
-
-    monkeypatch.setattr(pixie, "OUTDIR", str(tmp_path))
-
-    psscan = tmp_path / f"{pixie.WIN_PSSCAN}{pixie.SEP}mem1.json"
-    dlllist = tmp_path / f"{pixie.WIN_DLLLIST}{pixie.SEP}mem1.json"
-    files = tmp_path / "files_T_disk1.raw.json"
-
-    psscan.write_text(
-        json.dumps([
-            {
-                "PID": 123,
-                "ImageFileName": "calc.exe",
-                "CreateTime": "2024-01-01T10:00:00"
-            }
-        ]),
-        encoding="utf-8",
-    )
-    dlllist.write_text(
-        json.dumps([
-            {
-                "PID": 123,
-                "Path": "C:\\Windows\\System32\\calc.exe",
-                "Name": "kernel32.dll",
-                "LoadTime": "2024-01-01T10:00:01"
-            }
-        ]),
-        encoding="utf-8",
-    )
-    files.write_text(
-        json.dumps(
-            {
-                "C:/Windows/System32/calc.exe": {
-                    "name": "calc.exe",
-                    "atime": "2024-01-01T10:00:30"
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    pixie.ps_match(100)
-
-    out = tmp_path / "procmatches.json"
-    assert out.exists()
-
-    matches = json.loads(out.read_text(encoding="utf-8"))
-    assert len(matches) == 1
-    assert matches[0]["evi"] == "disk1.raw"
-    assert matches[0]["fpath"].lower().endswith("calc.exe")
-    assert len(matches[0]["relations"]) == 1
-
-
-def test_common_report_skips_malformed_input_file(tmp_path, monkeypatch):
-    pixie = import_pixie_module()
-    monkeypatch.setattr(pixie, "OUTDIR", str(tmp_path))
-
-    bad = tmp_path / f"{pixie.WIN_FILESCAN}{pixie.SEP}evi1.mem.json"
-    bad.write_text("{not-json", encoding="utf-8")
-
-    # Should safely degrade to an empty aggregate output.
-    pixie.common_report(bad.name, "files.json", "Name")
-    out = tmp_path / "files.json"
-    assert out.exists()
-    assert json.loads(out.read_text(encoding="utf-8")) == {}
-
-
-def test_common_conns_skips_non_list_json(tmp_path, monkeypatch):
-    pixie = import_pixie_module()
-    monkeypatch.setattr(pixie, "OUTDIR", str(tmp_path))
-
-    src = tmp_path / f"conns{pixie.SEP}evi1.mem.json"
-    src.write_text(json.dumps({"not": "a-list"}), encoding="utf-8")
-
-    pixie.common_conns(src.name, "conns.json")
-    assert not (tmp_path / "conns.json").exists()
-
-
-def test_common_files_skips_non_dict_json(tmp_path, monkeypatch):
-    pixie = import_pixie_module()
-    monkeypatch.setattr(pixie, "OUTDIR", str(tmp_path))
-
-    src = tmp_path / f"files{pixie.SEP}disk1.raw.json"
-    src.write_text(json.dumps(["not-a-dict"]), encoding="utf-8")
-
-    pixie.common_files(src.name, "files.json")
-    assert not (tmp_path / "files.json").exists()
-
-
 def test_auto_triage_invokes_pipeline_in_order(monkeypatch):
     pixie = import_pixie_module()
     calls = []
 
     monkeypatch.setattr(pixie, "scan_files", lambda indir: calls.append(("scan_files", indir)))
-    monkeypatch.setattr(pixie, "commonality", lambda: calls.append(("commonality",)))
-    monkeypatch.setattr(pixie, "ps_match", lambda deviation: calls.append(("ps_match", deviation)))
+    monkeypatch.setattr(pixie, "normalize_artifacts", lambda: calls.append(("normalize_artifacts",)))
+    monkeypatch.setattr(pixie, "run_correlations", lambda: calls.append(("run_correlations",)))
 
     pixie.auto_triage("evidence_dir")
 
     assert calls == [
         ("scan_files", "evidence_dir"),
-        ("commonality",),
-        ("ps_match", 100),
+        ("normalize_artifacts",),
+        ("run_correlations",),
     ]
 
 
@@ -189,9 +95,6 @@ def test_main_cli_smoke_mixed_evidence_best_effort(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_get_conns(indir, fname):
-        calls.append(("get_conns", fname))
-
     def fake_scan_memory(indir, fname, action):
         calls.append(("scan_memory", fname, action))
         if fname == "bad.mem":
@@ -203,18 +106,17 @@ def test_main_cli_smoke_mixed_evidence_best_effort(tmp_path, monkeypatch):
     def fake_scan_disk(indir, fname):
         calls.append(("scan_disk", fname))
 
-    def fake_commonality():
-        calls.append(("commonality",))
+    def fake_normalize_artifacts():
+        calls.append(("normalize_artifacts",))
 
-    def fake_ps_match(deviation):
-        calls.append(("ps_match", deviation))
+    def fake_run_correlations():
+        calls.append(("run_correlations",))
 
-    monkeypatch.setattr(pixie, "get_conns", fake_get_conns)
     monkeypatch.setattr(pixie, "scan_memory", fake_scan_memory)
     monkeypatch.setattr(pixie, "scan_pcap", fake_scan_pcap)
     monkeypatch.setattr(pixie, "scan_disk", fake_scan_disk)
-    monkeypatch.setattr(pixie, "commonality", fake_commonality)
-    monkeypatch.setattr(pixie, "ps_match", fake_ps_match)
+    monkeypatch.setattr(pixie, "normalize_artifacts", fake_normalize_artifacts)
+    monkeypatch.setattr(pixie, "run_correlations", fake_run_correlations)
     monkeypatch.setattr(pixie.sys, "argv", ["pixie.py", str(evidence)])
 
     pixie.main()
@@ -223,8 +125,169 @@ def test_main_cli_smoke_mixed_evidence_best_effort(tmp_path, monkeypatch):
     assert errdir.exists()
     assert ("scan_pcap", "net.pcap") in calls
     assert ("scan_disk", "disk.raw") in calls
-    assert ("commonality",) in calls
-    assert ("ps_match", 100) in calls
+    assert ("normalize_artifacts",) in calls
+    assert ("run_correlations",) in calls
+
+
+def test_normalize_artifacts_generates_expected_files(tmp_path, monkeypatch):
+    pixie = import_pixie_module()
+    monkeypatch.setattr(pixie, "OUTDIR", str(tmp_path))
+
+    (tmp_path / f"{pixie.WIN_PSSCAN}{pixie.SEP}mem1.json").write_text(
+        json.dumps([
+            {
+                "PID": 111,
+                "PPID": 4,
+                "ImageFileName": "evil.exe",
+                "CreateTime": "2024-01-01T10:00:00",
+                "CommandLine": "C:/Users/Public/evil.exe -q",
+                "Path": "C:/Users/Public/evil.exe",
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (tmp_path / f"{pixie.WIN_NETSCAN}{pixie.SEP}mem1.json").write_text(
+        json.dumps([
+            {
+                "PID": 111,
+                "LocalAddr": "10.0.0.5:50000",
+                "ForeignAddr": "8.8.8.8:443",
+                "Protocol": "TCP",
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (tmp_path / "files_T_disk1.raw.json").write_text(
+        json.dumps(
+            {
+                "C:/Users/Public/evil.exe": {
+                    "name": "evil.exe",
+                    "atime": "2024-01-01T10:01:00",
+                    "created": "2024-01-01T09:59:50",
+                    "modified": "2024-01-01T10:00:10",
+                    "is_executable": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "sample.pcap.json").write_text(
+        json.dumps([
+            {
+                "src": "10.0.0.5",
+                "dst": "8.8.8.8",
+                "src_port": 50000,
+                "dst_port": 443,
+                "timestamp": "2024-01-01T10:00:05+00:00",
+            }
+        ]),
+        encoding="utf-8",
+    )
+
+    pixie.normalize_artifacts()
+
+    mem = json.loads((tmp_path / "memory_artifacts.json").read_text(encoding="utf-8"))
+    disk = json.loads((tmp_path / "disk_artifacts.json").read_text(encoding="utf-8"))
+    net = json.loads((tmp_path / "network_artifacts.json").read_text(encoding="utf-8"))
+
+    assert len(mem) == 1
+    assert mem[0]["processes"][0]["pid"] == "111"
+    assert mem[0]["processes"][0]["ppid"] == "4"
+    assert mem[0]["sockets"][0]["remote_ip"] == "8.8.8.8"
+    assert mem[0]["sockets"][0]["remote_port"] == 443
+
+    assert len(disk) == 1
+    assert disk[0]["files"][0]["file_name"] == "evil.exe"
+    assert disk[0]["files"][0]["execution_indicator"] is True
+
+    assert len(net) == 1
+    assert net[0]["connections"][0]["dst_ip"] == "8.8.8.8"
+    assert net[0]["connections"][0]["timestamp"]
+
+
+def test_run_correlations_process_and_fileless_scenarios(tmp_path, monkeypatch):
+    pixie = import_pixie_module()
+    monkeypatch.setattr(pixie, "OUTDIR", str(tmp_path))
+
+    (tmp_path / "memory_artifacts.json").write_text(
+        json.dumps([
+            {
+                "evidence": "mem1",
+                "processes": [
+                    {
+                        "pid": "111",
+                        "ppid": "4",
+                        "process_name": "evil.exe",
+                        "command_line": "C:/Users/Public/evil.exe -q",
+                        "image_path": "C:/Users/Public/evil.exe",
+                        "start_time": "2024-01-01T10:00:00",
+                    }
+                ],
+                "sockets": [
+                    {
+                        "pid": "111",
+                        "process_name": "evil.exe",
+                        "local_endpoint": "10.0.0.5:50000",
+                        "remote_endpoint": "8.8.8.8:443",
+                        "remote_ip": "8.8.8.8",
+                        "remote_port": 443,
+                        "protocol": "TCP",
+                        "state": "ESTABLISHED",
+                    }
+                ],
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (tmp_path / "disk_artifacts.json").write_text(
+        json.dumps([
+            {
+                "evidence": "disk1",
+                "files": [
+                    {
+                        "file_name": "evil.exe",
+                        "file_path": "C:/Users/Public/evil.exe",
+                        "created_time": "2024-01-01T09:59:50",
+                        "modified_time": "2024-01-01T10:00:10",
+                        "access_time": "2024-01-01T10:01:00",
+                        "execution_indicator": True,
+                    }
+                ],
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (tmp_path / "network_artifacts.json").write_text(
+        json.dumps([
+            {
+                "evidence": "net1",
+                "connections": [
+                    {
+                        "src_ip": "10.0.0.5",
+                        "dst_ip": "8.8.8.8",
+                        "src_port": 50000,
+                        "dst_port": 443,
+                        "timestamp": "2024-01-01T10:00:05+00:00",
+                    }
+                ],
+            }
+        ]),
+        encoding="utf-8",
+    )
+
+    pixie.run_correlations(time_window_seconds=600)
+
+    output = json.loads((tmp_path / "correlations.json").read_text(encoding="utf-8"))
+    assert any(row.get("scenario") == "process-centric" for row in output)
+    assert any(row.get("scenario") == "fileless" for row in output)
+
+    proc = [row for row in output if row.get("scenario") == "process-centric"][0]
+    assert proc["match_strength"] in {"medium", "strong"}
+    assert proc["process"]["process_name"].lower() == "evil.exe"
+
+    fileless = [row for row in output if row.get("scenario") == "fileless"][0]
+    assert fileless["socket"]["remote_ip"] == "8.8.8.8"
+    assert fileless["notes"]["port_match"] is True
 
 
 def test_scan_mem_subproc_uses_adapter_contract(tmp_path, monkeypatch):

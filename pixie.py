@@ -1,523 +1,765 @@
-from thefuzz import fuzz
-from typing import Any, cast
+from typing import Any, Mapping, TypedDict, cast
 import datetime
-import playbook
-import psreport
-from volatility_adapter import VolatilityAdapter
-import pytsk3
-import dpkt
+from pathlib import Path
 import glob
 import sys
 import os
-import re
 import socket
 import logging
-from utilities import (
-    ensure_runtime_dirs,
-    is_playbook_path,
-    load_evidence_map,
-    load_json_file,
-    normalize_output_evidence_name,
-    parse_timestamp,
-    skip_missing_or_empty_file,
-    write_json,
-)
 
-WINDOWS = "windows."
-WIN_FILESCAN = WINDOWS + "filescan"
-WIN_PSSCAN = WINDOWS + "psscan"
-WIN_NETSCAN = WINDOWS + "netscan"
-WIN_DLLLIST = WINDOWS + "dlllist"
-OUTDIR = "data"
-ERRDIR = "err"
-SEP = "_T_"
-UNKNOWN_ATIME = "1970-01-01T01:01:01"
+import constants as C
+from utilities import ensure_runtime_dirs, load_json_file, normalize_output_evidence_name, parse_timestamp, write_json
+from volatility_adapter import VolatilityAdapter
+import pytsk3
+import dpkt  # type: ignore[import-untyped]
 
-MEMORY_EXTENSIONS = {"mem", "bin", "lime"}
-PACKET_EXTENSIONS = {"pcap", "pcapng"}
-DISK_EXTENSIONS = {"dd", "001", "raw"}
-SCAN_ACTIONS = [WIN_FILESCAN, WIN_PSSCAN, WIN_NETSCAN, WIN_DLLLIST]
+# Backward-compatible exports expected by tests/callers.
+WIN_FILESCAN = C.WIN_FILESCAN
+WIN_PSSCAN = C.WIN_PSSCAN
+WIN_NETSCAN = C.WIN_NETSCAN
+WIN_DLLLIST = C.WIN_DLLLIST
+SEP = C.SEP
+OUTDIR = C.OUTDIR
+ERRDIR = C.ERRDIR
+DEFAULT_TIME_WINDOW_SECONDS = C.DEFAULT_TIME_WINDOW_SECONDS
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format=C.LOG_FORMAT)
 
 JsonMap = dict[str, Any]
-EvidenceMap = dict[str, list[Any]]
-PathAtimeMap = dict[str, dict[str, str]]
+PathMetaMap = dict[str, dict[str, str | bool]]
 ConnRecord = dict[str, str | int | None]
+
+
+class ProcessRow(TypedDict):
+    pid: str
+    ppid: str
+    process_name: str
+    command_line: str
+    image_path: str
+    start_time: str
+    parent_name: str
+
+
+class SocketRow(TypedDict):
+    pid: str
+    process_name: str
+    local_endpoint: str
+    remote_endpoint: str
+    remote_ip: str
+    remote_port: int | None
+    protocol: str
+    state: str
+
+
+class DiskFileRow(TypedDict):
+    file_name: str
+    file_path: str
+    created_time: str
+    modified_time: str
+    access_time: str
+    execution_indicator: bool
+
+
+class NetworkConnRow(TypedDict):
+    src_ip: str
+    dst_ip: str
+    src_port: Any
+    dst_port: Any
+    timestamp: str
+    remote_candidates: list[str]
+
+
+class MemoryArtifact(TypedDict):
+    evidence: str
+    processes: list[ProcessRow]
+    sockets: list[SocketRow]
+
+
+class DiskArtifact(TypedDict):
+    evidence: str
+    files: list[DiskFileRow]
+
+
+class NetworkArtifact(TypedDict):
+    evidence: str
+    connections: list[NetworkConnRow]
+
+
+class ProcessEvidence(TypedDict):
+    memory: str
+    disk: str
+
+
+class FilelessEvidence(TypedDict):
+    memory: str
+    network: str
+
+
+class ProcessNotes(TypedDict):
+    path_match: bool
+    time_aligned: bool
+    uncertainty: list[str]
+
+
+class FilelessNotes(TypedDict):
+    port_match: bool
+    process_attributed: bool
+    uncertainty: list[str]
+
+
+class ProcessCorrelation(TypedDict):
+    scenario: str
+    match_strength: str
+    confidence_score: int
+    join_keys: list[str]
+    evidence: ProcessEvidence
+    process: ProcessRow
+    disk_file: DiskFileRow
+    notes: ProcessNotes
+    statement: str
+
+
+class FilelessCorrelation(TypedDict):
+    scenario: str
+    match_strength: str
+    confidence_score: int
+    join_keys: list[str]
+    evidence: FilelessEvidence
+    socket: SocketRow
+    network_connection: NetworkConnRow
+    notes: FilelessNotes
+    statement: str
+
+
+ProcessRecord = tuple[str, ProcessRow]
+SocketRecord = tuple[str, SocketRow]
+DiskRecord = tuple[str, DiskFileRow]
+NetworkRecord = tuple[str, NetworkConnRow]
+CorrelationRow = ProcessCorrelation | FilelessCorrelation
 
 VOLATILITY_ADAPTER = VolatilityAdapter(prefer_library=True, enable_cli_fallback=True)
 
 
-# Scanners ------------------------------------------------------------------
+def _norm_join_path(value: str) -> str:
+    return str(value).replace(C.KEY_BACKSLASH, C.KEY_SLASH).lower()
 
 
-def get_conns(indir: str, fname: str) -> None:
-    """Extract IPv4-like byte patterns from memory image and persist as json list."""
-    inpath = os.path.join(indir, fname)
-    ipat = re.compile(rb"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+def _path_basename(value: str) -> str:
+    return Path(_norm_join_path(value)).name
 
-    with open(inpath, "rb") as fh:
-        data = fh.read()
 
-    ips = ipat.findall(data)
-    ips = [ip.decode("utf-8") for ip in ips]
+def _safe_str(row: Mapping[str, Any], key: str, default: str = C.KEY_EMPTY) -> str:
+    return str(row.get(key, default)).strip()
 
-    outpath = os.path.join(OUTDIR, "conns" + SEP + fname + ".json")
-    write_json(outpath, ips)
+
+def _as_any_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return cast(list[Any], value)
+    return []
+
+
+def _as_json_map(value: Any) -> JsonMap:
+    if isinstance(value, dict):
+        return cast(JsonMap, value)
+    return {}
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(row: Mapping[str, Any], keys: tuple[str, ...], default: str = C.KEY_EMPTY) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        sval = str(value).strip()
+        if sval:
+            return sval
+    return default
+
+
+def _scan_error_path(action: str, fname: str) -> str:
+    return os.path.join(ERRDIR, C.ERR_PREFIX + C.SEP + action + C.SEP + fname + C.EXT_LOG)
+
+
+def _scan_output_path(action: str, fname: str) -> str:
+    return os.path.join(OUTDIR, action + C.SEP + fname + C.EXT_JSON)
 
 
 def scan_memory(indir: str, fname: str, action: str) -> None:
-    """Best-effort memory plugin scan for one action."""
     try:
         scan_mem_subproc(indir, fname, action)
     except Exception as e:
-        logger.exception("Error in %s for %s: %s", fname, action, e)
+        logger.exception(C.MSG_SCAN_ERROR, fname, action, e)
 
 
 def scan_mem_subproc(indir: str, fname: str, action: str) -> None:
     inpath = os.path.join(indir, fname)
-    errpath = os.path.join(ERRDIR, "err" + SEP + action + SEP + fname + ".log")
-    outpath = os.path.join(OUTDIR, action + SEP + fname + ".json")
-
+    outpath = _scan_output_path(action, fname)
+    errpath = _scan_error_path(action, fname)
     VOLATILITY_ADAPTER.run_plugin(inpath, action, outpath, errpath)
-
-    if os.path.exists(outpath):
-        size = os.path.getsize(outpath)
-        if size == 0:
-            os.remove(outpath)
+    if os.path.exists(outpath) and os.path.getsize(outpath) == 0:
+        os.remove(outpath)
 
 
 def scan_pcap(indir: str, fname: str) -> None:
-    """Extract packet endpoint tuples from pcap/pcapng input."""
-    iplist: list[ConnRecord] = []
+    rows: list[ConnRecord] = []
     fpath = os.path.join(indir, fname)
-    with open(fpath, "rb") as fh:
+    with open(fpath, C.FILE_MODE_READ_BINARY) as fh:
         dpkt_api = cast(Any, dpkt)
-        packets = dpkt_api.pcapng.Reader(fh) if fname.lower().endswith("pcapng") else dpkt_api.pcap.Reader(fh)
-        for _ts, buf in packets:
-            try:
-                eth = dpkt_api.ethernet.Ethernet(buf)
-                ip = eth.data
-                if not hasattr(ip, "src") or not hasattr(ip, "dst"):
-                    continue
+        reader = dpkt_api.pcapng.Reader if fname.lower().endswith(C.EXT_PCAPNG) else dpkt_api.pcap.Reader
+        for ts, buf in reader(fh):
+            row = _parse_packet_row(dpkt_api, ts, buf)
+            if row:
+                rows.append(row)
+    write_json(os.path.join(OUTDIR, fname + C.EXT_JSON), rows)
 
-                src_ip = socket.inet_ntoa(cast(bytes, getattr(ip, "src")))
-                dst_ip = socket.inet_ntoa(cast(bytes, getattr(ip, "dst")))
-                src_port = getattr(ip.data, "sport", None)
-                dst_port = getattr(ip.data, "dport", None)
 
-                iplist.append({"src": src_ip, "dst": dst_ip, "src_port": src_port, "dst_port": dst_port})
-            except (ValueError, AttributeError, dpkt_api.dpkt.NeedData):
-                continue
-
-    outpath = os.path.join(OUTDIR, fname + ".json")
-    write_json(outpath, iplist)
+def _parse_packet_row(dpkt_api: Any, ts: Any, buf: bytes) -> ConnRecord | None:
+    try:
+        eth = dpkt_api.ethernet.Ethernet(buf)
+        ip = eth.data
+        if not hasattr(ip, C.ATTR_SRC) or not hasattr(ip, C.ATTR_DST):
+            return None
+        src_ip = socket.inet_ntoa(cast(bytes, getattr(ip, C.ATTR_SRC)))
+        dst_ip = socket.inet_ntoa(cast(bytes, getattr(ip, C.ATTR_DST)))
+        src_port = getattr(ip.data, C.ATTR_SPORT, None)
+        dst_port = getattr(ip.data, C.ATTR_DPORT, None)
+        ts_iso = datetime.datetime.fromtimestamp(float(ts), tz=datetime.timezone.utc).isoformat()
+        return {
+            C.IN_SRC: src_ip,
+            C.IN_DST: dst_ip,
+            C.IN_SRC_PORT: src_port,
+            C.IN_DST_PORT: dst_port,
+            C.IN_TIMESTAMP: ts_iso,
+        }
+    except (ValueError, AttributeError, dpkt_api.dpkt.NeedData):
+        return None
 
 
 def scan_disk(indir: str, fname: str) -> None:
-    """Enumerate files from disk image and persist path/atime map."""
-    inpath = os.path.join(indir, fname)
     tsk = cast(Any, pytsk3)
-    img = tsk.Img_Info(inpath)
+    img = tsk.Img_Info(os.path.join(indir, fname))
     fs = tsk.FS_Info(img)
-    root = fs.open_dir(path="/")
-
-    file_list = list_files(root)
-
-    outpath = os.path.join(OUTDIR, "files" + SEP + fname + ".json")
-    write_json(outpath, file_list)
+    root = fs.open_dir(path=C.KEY_SLASH)
+    write_json(os.path.join(OUTDIR, C.FILES_PREFIX + C.SEP + fname + C.EXT_JSON), list_files(root))
 
 
-def list_files(root: Any) -> PathAtimeMap:
-    """Depth-first traversal of TSK filesystem directory objects."""
-    stack: list[tuple[Any, str]] = [(root, "")]
-    file_list: PathAtimeMap = {}
-
+def list_files(root: Any) -> PathMetaMap:
+    stack: list[tuple[Any, str]] = [(root, C.KEY_EMPTY)]
+    output: PathMetaMap = {}
     while stack:
-        current_dir, path = stack.pop()
+        current_dir, parent = stack.pop()
         for fsobj in current_dir:
-            raw_name = fsobj.info.name.name
-            if isinstance(raw_name, (bytes, bytearray)):
-                fname = raw_name.decode("utf-8", errors="ignore")
-            else:
-                fname = str(raw_name)
-
-            if fname in [".", ".."]:
+            parsed = _parse_fsobj(fsobj, parent)
+            if not parsed:
                 continue
-
-            fpath = f"{path}/{fname}" if path else fname
-
-            if fsobj.info.meta is None:
-                file_list[fpath] = {"name": fname, "atime": UNKNOWN_ATIME}
+            kind, path, payload = parsed
+            if kind == C.KEY_DOT:
+                stack.append((payload, path))
                 continue
+            output[path] = payload
+    return output
 
-            if fsobj.info.meta.type == cast(Any, pytsk3).TSK_FS_META_TYPE_DIR:
-                subdir = fsobj.as_directory()
-                stack.append((subdir, fpath))
-            else:
-                atime = UNKNOWN_ATIME
-                if fsobj.info.meta.atime:
-                    atime = datetime.datetime.fromtimestamp(fsobj.info.meta.atime).isoformat()
-                file_list[fpath] = {"name": fname, "atime": atime}
 
-    return file_list
+def _parse_fsobj(fsobj: Any, parent: str) -> tuple[str, str, Any] | None:
+    raw_name = fsobj.info.name.name
+    name = raw_name.decode(C.ENCODING_UTF8, errors=C.ERRORS_IGNORE) if isinstance(raw_name, (bytes, bytearray)) else str(raw_name)
+    if name in {C.KEY_DOT, C.KEY_DOTDOT}:
+        return None
+
+    path = f"{parent}{C.KEY_SLASH}{name}" if parent else name
+    meta = fsobj.info.meta
+    if meta is None:
+        return C.KEY_EMPTY, path, _file_meta(name, C.UNKNOWN_TIME, C.UNKNOWN_TIME, C.UNKNOWN_TIME)
+
+    if meta.type == cast(Any, pytsk3).TSK_FS_META_TYPE_DIR:
+        return C.KEY_DOT, path, fsobj.as_directory()
+
+    atime = _meta_time(meta.atime)
+    ctime = _meta_time(getattr(meta, C.ATTR_CRTIME, 0))
+    mtime = _meta_time(getattr(meta, C.ATTR_MTIME, 0))
+    return C.KEY_EMPTY, path, _file_meta(name, atime, ctime, mtime)
+
+
+def _meta_time(value: Any) -> str:
+    if value:
+        return datetime.datetime.fromtimestamp(value).isoformat()
+    return C.UNKNOWN_TIME
+
+
+def _file_meta(name: str, atime: str, ctime: str, mtime: str) -> dict[str, str | bool]:
+    return {
+        C.META_NAME: name,
+        C.META_ATIME: atime,
+        C.META_CREATED: ctime,
+        C.META_MODIFIED: mtime,
+        C.META_IS_EXECUTABLE: name.lower().endswith(C.EXT_EXE),
+    }
 
 
 def scan_files(indir: str) -> None:
-    """Dispatch each evidence file to scanner(s) based on extension."""
-    fnames = sorted(os.listdir(indir))
-    for fname in fnames:
+    for fname in sorted(os.listdir(indir)):
         fpath = os.path.join(indir, fname)
         if not os.path.isfile(fpath):
             continue
-
-        ext = fname.split(".")[-1].lower()
+        ext = fname.split(C.KEY_DOT)[-1].lower()
         try:
-            if ext in MEMORY_EXTENSIONS:
-                get_conns(indir, fname)
-                for action in SCAN_ACTIONS:
-                    scan_memory(indir, fname, action)
-                continue
-
-            if ext in PACKET_EXTENSIONS:
-                scan_pcap(indir, fname)
-                continue
-
-            if ext in DISK_EXTENSIONS:
-                scan_disk(indir, fname)
+            _scan_by_extension(indir, fname, ext)
         except Exception:
-            logger.exception("Failed processing %s", fname)
+            logger.exception(C.MSG_FILE_FAIL, fname)
 
 
-# Aggregation and reporting --------------------------------------------------
-
-def common_files(fname: str, rname: str) -> None:
-    """Aggregate disk file path evidence matches across inputs."""
-    fpath = os.path.join(OUTDIR, fname)
-    evidence_name = normalize_output_evidence_name(fname, SEP)
-
-    if skip_missing_or_empty_file(fpath):
+def _scan_by_extension(indir: str, fname: str, ext: str) -> None:
+    if ext in C.MEMORY_EXTENSIONS:
+        for action in C.SCAN_ACTIONS:
+            scan_memory(indir, fname, action)
         return
-
-    dd_fmap = load_json_file(fpath, {})
-    if not isinstance(dd_fmap, dict):
+    if ext in C.PACKET_EXTENSIONS:
+        scan_pcap(indir, fname)
         return
-    dd_fmap = cast(JsonMap, dd_fmap)
-
-    report_data = load_evidence_map(OUTDIR, rname)
-    report_data = fuzz_match(dd_fmap, report_data, evidence_name, "")
-
-    write_json(os.path.join(OUTDIR, rname), report_data)
+    if ext in C.DISK_EXTENSIONS:
+        scan_disk(indir, fname)
 
 
-def fuzz_match(srcmap: list[Any] | JsonMap, dstmap: EvidenceMap, fname: str, skey: str) -> EvidenceMap:
-    """Merge artefact values into aggregate evidence map with fuzzy fallback matching."""
-    if len(dstmap) == 0:
-        for artefact in srcmap:
-            artefact_val: Any = artefact
-            if skey != "":
-                if not isinstance(artefact_val, dict):
-                    continue
-                artefact_map = cast(dict[str, Any], artefact_val)
-                if skey not in artefact_map:
-                    continue
-                artefact_val = artefact_map[skey]
-            if artefact_val is None:
-                continue
-            dstmap[str(cast(object, artefact_val))] = [fname]
-        return dstmap
-
-    newfiles: dict[str, str] = {}
-    for artefact in srcmap:
-        artefact_val: Any = artefact
-        if skey != "":
-            if not isinstance(artefact_val, dict):
-                continue
-            artefact_map = cast(dict[str, Any], artefact_val)
-            if skey not in artefact_map:
-                continue
-            artefact_val = artefact_map[skey]
-        if artefact_val is None:
-            continue
-
-        artefact = str(cast(object, artefact_val))
-        if artefact in dstmap:
-            if fname not in dstmap[artefact]:
-                dstmap[artefact].append(fname)
-        else:
-            for dst_map_file, file_list in dstmap.items():
-                if fname in file_list:
-                    continue
-
-                dmf = dst_map_file.replace("\\", "/")
-                smf = artefact.replace("\\", "/")
-
-                conf = int(cast(Any, fuzz).ratio(dmf, smf))
-                if {"evi": fname, "fpath": artefact, "conf": conf} in file_list:
-                    continue
-
-                if 85 <= conf < 100:
-                    dmf = dmf.split("/")[-1]
-                    smf = smf.split("/")[-1]
-
-                    if dmf == smf:
-                        file_list.append({"evi": fname, "fpath": artefact, "conf": conf})
-                        dstmap[dst_map_file] = file_list
-                        break
-
-                if conf < 85:
-                    newfiles[artefact] = fname
-
-    for nkey in newfiles:
-        dstmap[nkey] = [newfiles[nkey]]
-
-    return dstmap
+def _base_name(value: str) -> str:
+    return _path_basename(value).lower()
 
 
-def common_conns(fname: str, rname: str) -> None:
-    """Aggregate plain connection lists across evidence sources."""
-    fpath = os.path.join(OUTDIR, fname)
-    evidence_name = normalize_output_evidence_name(fname, SEP)
-
-    if skip_missing_or_empty_file(fpath):
-        return
-
-    flist = load_json_file(fpath, [])
-    if not isinstance(flist, list):
-        return
-    flist = cast(list[Any], flist)
-
-    report_data = load_evidence_map(OUTDIR, rname)
-
-    for file_name in flist:
-        file_name = str(file_name)
-        if file_name in report_data:
-            if evidence_name in report_data[file_name]:
-                continue
-            report_data[file_name].append(evidence_name)
-        else:
-            report_data[file_name] = [evidence_name]
-
-    write_json(os.path.join(OUTDIR, rname), report_data)
+def _normalize_path(value: str) -> str:
+    return _norm_join_path(value).strip()
 
 
-def common_report(fname: str, rname: str, skey: str) -> None:
-    """Aggregate list-of-record scan outputs into a common report."""
-    fpath = os.path.join(OUTDIR, fname)
-    evidence_name = normalize_output_evidence_name(fname, SEP)
-
-    if skip_missing_or_empty_file(fpath):
-        return
-
-    flmap = load_json_file(fpath, [])
-    if not isinstance(flmap, list):
-        return
-    flmap = cast(list[Any], flmap)
-
-    report_data = load_evidence_map(OUTDIR, rname)
-    report_data = fuzz_match(flmap, report_data, evidence_name, skey)
-
-    write_json(os.path.join(OUTDIR, rname), report_data)
+def _split_ip_port(endpoint: str) -> tuple[str, int | None]:
+    value = str(endpoint or C.KEY_EMPTY).strip()
+    if not value:
+        return C.KEY_EMPTY, None
+    if C.KEY_COLON not in value:
+        return value, None
+    ip, port = value.rsplit(C.KEY_COLON, 1)
+    parsed = _safe_int(port)
+    if parsed is None:
+        return value, None
+    return ip, parsed
 
 
-def commonality() -> None:
-    """Build aggregated cross-evidence reports from generated scan outputs."""
-    fnames = os.listdir(OUTDIR)
-    for fname in fnames:
-        if WIN_FILESCAN in fname:
-            common_report(fname, "files.json", "Name")
-        if WIN_DLLLIST in fname:
-            common_report(fname, "dlls.json", "Name")
-        if WIN_PSSCAN in fname:
-            common_report(fname, "processes.json", "ImageFileName")
-        if WIN_NETSCAN in fname:
-            common_report(fname, "conns.json", "LocalAddr")
-            common_report(fname, "conns.json", "ForeignAddr")
-        if "conns" + SEP in fname:
-            common_conns(fname, "conns.json")
-        if ".pcap." in fname:
-            common_report(fname, "conns.json", "src")
-        if any(ext in fname for ext in [".dd.", ".001.", ".raw."]):
-            common_files(fname, "files.json")
+def _build_memory_artifacts() -> list[MemoryArtifact]:
+    artifacts: list[MemoryArtifact] = []
+    pattern = os.path.join(OUTDIR, C.WIN_PSSCAN + C.GLOB_ALL)
+    for psscan_file in glob.glob(pattern):
+        psscan_rows = _as_rows(load_json_file(psscan_file, []))
+        netscan_rows = _as_rows(load_json_file(psscan_file.replace(C.WIN_PSSCAN, C.WIN_NETSCAN), []))
+        evidence = normalize_output_evidence_name(psscan_file, C.SEP)
+        processes, index = _normalize_processes(psscan_rows)
+        sockets = _normalize_sockets(netscan_rows, index)
+        artifacts.append({C.OUT_EVIDENCE: evidence, C.OUT_PROCESSES: processes, C.OUT_SOCKETS: sockets})
+    return artifacts
 
 
-def get_rels() -> list[psreport.Relation]:
-    """Build process->DLL relationship records from psscan and dlllist outputs."""
-    rels: list[psreport.Relation] = []
-    jrels: list[dict[str, Any]] = []
-    pattern = os.path.join(OUTDIR, WIN_PSSCAN + "*")
+def _as_rows(value: Any) -> list[JsonMap]:
+    rows: list[JsonMap] = []
+    for row in _as_any_list(value):
+        if isinstance(row, dict):
+            rows.append(cast(JsonMap, row))
+    return rows
 
+
+def _normalize_processes(rows: list[JsonMap]) -> tuple[list[ProcessRow], dict[str, ProcessRow]]:
+    processes = [_normalize_process_row(row) for row in rows]
+    index = {str(row.get(C.OUT_PID, C.KEY_EMPTY)): row for row in processes if str(row.get(C.OUT_PID, C.KEY_EMPTY))}
+    for row in processes:
+        ppid = _safe_str(row, C.OUT_PPID)
+        parent = index.get(ppid)
+        row[C.OUT_PARENT_NAME] = _safe_str(parent or {}, C.OUT_PROCESS_NAME)
+    return processes, index
+
+
+def _normalize_process_row(row: JsonMap) -> ProcessRow:
+    return {
+        C.OUT_PID: _safe_str(row, C.IN_PID),
+        C.OUT_PPID: _first_present(row, (C.IN_PPID, C.IN_PARENT_PID)),
+        C.OUT_PROCESS_NAME: _first_present(row, (C.IN_IMAGE_FILE_NAME, C.IN_NAME)),
+        C.OUT_COMMAND_LINE: _first_present(row, (C.IN_COMMAND_LINE, C.IN_CMDLINE)),
+        C.OUT_IMAGE_PATH: _first_present(row, (C.IN_PATH, C.IN_IMAGE_PATH)),
+        C.OUT_START_TIME: _first_present(row, (C.IN_CREATE_TIME, C.IN_START_TIME)),
+        C.OUT_PARENT_NAME: C.KEY_EMPTY,
+    }
+
+
+def _normalize_sockets(rows: list[JsonMap], process_index: dict[str, ProcessRow]) -> list[SocketRow]:
+    sockets: list[SocketRow] = []
+    for row in rows:
+        pid = _first_present(row, (C.IN_PID, C.IN_OWNER_PID, C.IN_PID_ALT))
+        remote = _first_present(row, (C.IN_FOREIGN_ADDR, C.IN_REMOTE_ADDR, C.IN_REMOTE_ADDR_ALT))
+        remote_ip, remote_port = _split_ip_port(remote)
+        sockets.append(
+            {
+                C.OUT_PID: pid,
+                C.OUT_PROCESS_NAME: _safe_str(process_index.get(pid, {}), C.OUT_PROCESS_NAME) if pid else C.KEY_EMPTY,
+                C.OUT_LOCAL_ENDPOINT: _first_present(row, (C.IN_LOCAL_ADDR, C.IN_LOCAL_ADDR_ALT)),
+                C.OUT_REMOTE_ENDPOINT: remote,
+                C.OUT_REMOTE_IP: remote_ip,
+                C.OUT_REMOTE_PORT: remote_port,
+                C.OUT_PROTOCOL: _first_present(row, (C.IN_PROTO, C.IN_PROTOCOL)),
+                C.OUT_STATE: _safe_str(row, C.IN_STATE),
+            }
+        )
+    return sockets
+
+
+def _build_disk_artifacts() -> list[DiskArtifact]:
+    artifacts: list[DiskArtifact] = []
+    pattern = os.path.join(OUTDIR, C.FILES_PREFIX + C.SEP + C.GLOB_ALL)
     for fname in glob.glob(pattern):
-        ps_data = load_json_file(fname, [])
-        if not isinstance(ps_data, list):
+        rows = _normalize_disk_rows(load_json_file(fname, {}))
+        evidence = normalize_output_evidence_name(fname, C.SEP)
+        artifacts.append({C.OUT_EVIDENCE: evidence, C.OUT_FILES: rows})
+    return artifacts
+
+
+def _normalize_disk_rows(value: Any) -> list[DiskFileRow]:
+    value_map = _as_json_map(value)
+    if not value_map:
+        return []
+    rows: list[DiskFileRow] = []
+    for fpath, meta in value_map.items():
+        if not isinstance(meta, dict):
             continue
-        ps_data = cast(list[Any], ps_data)
-
-        dll_fname = fname.replace(WIN_PSSCAN, WIN_DLLLIST)
-        dll_data = load_json_file(dll_fname, [])
-        if not isinstance(dll_data, list):
-            dll_data = []
-        dll_data = cast(list[Any], dll_data)
-
-        evidence_name = normalize_output_evidence_name(fname, SEP)
-
-        for ps in ps_data:
-            if not isinstance(ps, dict):
-                continue
-            ps = cast(JsonMap, ps)
-
-            pid = str(ps.get("PID", ""))
-            proc_name = str(ps.get("ImageFileName", ""))
-            create_time = str(ps.get("CreateTime", ""))
-            proc_path = ""
-            dll_entries: list[psreport.DLLEntry] = []
-
-            for dll in dll_data:
-                if not isinstance(dll, dict):
-                    continue
-                dll = cast(JsonMap, dll)
-
-                if ps.get("PID") == dll.get("PID"):
-                    ppath = str(dll.get("Path", ""))
-                    if ppath.lower().endswith(proc_name.lower()):
-                        proc_path = ppath
-                    dll_entries.append(
-                        psreport.DLLEntry(
-                            dll_path=ppath,
-                            dll_name=str(dll.get("Name", "")),
-                            load_time=str(dll.get("LoadTime", "")),
-                        )
-                    )
-
-            if not proc_path:
-                proc_path = proc_name
-
-            rel = psreport.Relation(
-                proc_path=proc_path,
-                proc_name=proc_name,
-                confidence=100,
-                actual_deviation=0,
-                create_time=create_time,
-                evi=evidence_name,
-                pid=pid,
-                dll=dll_entries,
-            )
-            jrels.append(rel.model_dump())
-            rels.append(rel)
-
-    write_json(os.path.join(OUTDIR, "proc_dlls.json"), jrels)
-    return rels
+        row = cast(JsonMap, meta)
+        file_name = _safe_str(row, C.META_NAME, Path(str(fpath)).name)
+        rows.append(
+            {
+                C.OUT_FILE_NAME: file_name,
+                C.OUT_FILE_PATH: str(fpath),
+                C.OUT_CREATED_TIME: _safe_str(row, C.META_CREATED),
+                C.OUT_MODIFIED_TIME: _safe_str(row, C.META_MODIFIED),
+                C.OUT_ACCESS_TIME: _safe_str(row, C.META_ATIME),
+                C.OUT_EXECUTION_INDICATOR: bool(row.get(C.META_IS_EXECUTABLE, file_name.lower().endswith(C.EXT_EXE))),
+            }
+        )
+    return rows
 
 
-def ps_match(deviation: int) -> None:
-    """Match executable disk access times against memory process creation events."""
-    psmatches: list[dict[str, Any]] = []
-    rels = get_rels()
-    pattern = os.path.join(OUTDIR, "files_*")
+def _build_network_artifacts() -> list[NetworkArtifact]:
+    artifacts: list[NetworkArtifact] = []
+    patterns = [
+        os.path.join(OUTDIR, f"*{C.KEY_DOT}{C.EXT_PCAP}{C.EXT_JSON}"),
+        os.path.join(OUTDIR, f"*{C.KEY_DOT}{C.EXT_PCAPNG}{C.EXT_JSON}"),
+    ]
+    for fname in _expand_patterns(patterns):
+        rows = _normalize_network_rows(load_json_file(fname, []))
+        evidence = Path(fname).name.replace(C.EXT_JSON, C.KEY_EMPTY)
+        artifacts.append({C.OUT_EVIDENCE: evidence, C.OUT_CONNECTIONS: rows})
+    return artifacts
 
-    for fname in glob.glob(pattern):
-        fdata = load_json_file(fname, {})
-        if not isinstance(fdata, dict):
+
+def _expand_patterns(patterns: list[str]) -> list[str]:
+    files: list[str] = []
+    for pattern in patterns:
+        files.extend(glob.glob(pattern))
+    return sorted(files)
+
+
+def _normalize_network_rows(value: Any) -> list[NetworkConnRow]:
+    rows = _as_rows(value)
+    return [_normalize_network_row(row) for row in rows]
+
+
+def _normalize_network_row(row: JsonMap) -> NetworkConnRow:
+    src = _safe_str(row, C.IN_SRC)
+    dst = _safe_str(row, C.IN_DST)
+    src_port = row.get(C.IN_SRC_PORT)
+    dst_port = row.get(C.IN_DST_PORT)
+    return {
+        C.OUT_SRC_IP: src,
+        C.OUT_DST_IP: dst,
+        C.IN_SRC_PORT: src_port,
+        C.IN_DST_PORT: dst_port,
+        C.IN_TIMESTAMP: _safe_str(row, C.IN_TIMESTAMP),
+        C.OUT_REMOTE_CANDIDATES: [_endpoint_candidate(src, src_port), _endpoint_candidate(dst, dst_port)],
+    }
+
+
+def _endpoint_candidate(ip: str, port: Any) -> str:
+    if ip and port is not None:
+        return f"{ip}{C.KEY_COLON}{port}"
+    return ip
+
+
+def normalize_artifacts() -> None:
+    write_json(os.path.join(OUTDIR, C.OUT_MEMORY_ARTIFACTS), _build_memory_artifacts())
+    write_json(os.path.join(OUTDIR, C.OUT_DISK_ARTIFACTS), _build_disk_artifacts())
+    write_json(os.path.join(OUTDIR, C.OUT_NETWORK_ARTIFACTS), _build_network_artifacts())
+
+
+def _match_strength(path_or_proc_ok: bool, time_ok: bool) -> tuple[str, int]:
+    if path_or_proc_ok and time_ok:
+        return C.MATCH_STRONG, C.SCORE_STRONG
+    if path_or_proc_ok or time_ok:
+        return C.MATCH_MEDIUM, C.SCORE_MEDIUM
+    return C.MATCH_SIMPLE, C.SCORE_SIMPLE
+
+
+def _find_file_time(file_row: DiskFileRow) -> int | None:
+    for key in C.FILE_TIME_KEYS:
+        ts = parse_timestamp(_safe_str(file_row, key))
+        if ts is not None:
+            return ts
+    return None
+
+
+def _collect_process_records(memory_artifacts: list[Any]) -> list[ProcessRecord]:
+    records: list[ProcessRecord] = []
+    for artifact in memory_artifacts:
+        if not isinstance(artifact, dict):
             continue
-        fdata = cast(JsonMap, fdata)
-
-        evidence_name = normalize_output_evidence_name(fname, SEP)
-
-        for fitem, fmeta in fdata.items():
-            fitem = str(fitem)
-            if not fitem.lower().endswith(".exe"):
-                continue
-
-            if not isinstance(fmeta, dict):
-                continue
-            fmeta = cast(JsonMap, fmeta)
-
-            atime = parse_timestamp(str(fmeta.get("atime", "")))
-            if atime is None:
-                continue
-
-            psmatch_relations: list[psreport.Relation] = []
-            access_time = str(fmeta.get("atime", ""))
-
-            for rel in rels:
-                if rel.create_time.startswith("1970"):
-                    continue
-
-                ctime = parse_timestamp(rel.create_time)
-                if ctime is None:
-                    continue
-
-                diff = abs(atime - ctime)
-                if diff > deviation:
-                    continue
-
-                proc_disk = fitem.replace("\\", "/")
-                proc_mem = str(rel.proc_path).replace("\\", "/")
-                confidence = int(cast(Any, fuzz).ratio(proc_disk, proc_mem))
-                if confidence > 85:
-                    if proc_disk.split("/")[-1] == proc_mem.split("/")[-1]:
-                        rel_copy = rel.model_copy(deep=True)
-                        rel_copy.actual_deviation = diff
-                        rel_copy.confidence = confidence
-                        psmatch_relations.append(rel_copy)
-
-            if len(psmatch_relations) == 0:
-                continue
-
-            psmatches.append(
-                psreport.PSMatch(
-                    fpath=fitem,
-                    access_time=access_time,
-                    allowed_deviation=deviation,
-                    evi=evidence_name,
-                    relations=psmatch_relations,
-                ).model_dump()
-            )
-
-    write_json(os.path.join(OUTDIR, "procmatches.json"), psmatches)
+        art_map = cast(JsonMap, artifact)
+        evidence = _safe_str(art_map, C.OUT_EVIDENCE)
+        rows = _as_any_list(art_map.get(C.OUT_PROCESSES, []))
+        for row in rows:
+            if isinstance(row, dict):
+                records.append((evidence, cast(ProcessRow, row)))
+    return records
 
 
-# Orchestration and CLI ------------------------------------------------------
+def _collect_socket_records(memory_artifacts: list[Any]) -> list[SocketRecord]:
+    records: list[SocketRecord] = []
+    for artifact in memory_artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        art_map = cast(JsonMap, artifact)
+        evidence = _safe_str(art_map, C.OUT_EVIDENCE)
+        rows = _as_any_list(art_map.get(C.OUT_SOCKETS, []))
+        for row in rows:
+            if isinstance(row, dict):
+                records.append((evidence, cast(SocketRow, row)))
+    return records
+
+
+def _collect_disk_records(disk_artifacts: list[Any]) -> list[DiskRecord]:
+    records: list[DiskRecord] = []
+    for artifact in disk_artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        art_map = cast(JsonMap, artifact)
+        evidence = _safe_str(art_map, C.OUT_EVIDENCE)
+        rows = _as_any_list(art_map.get(C.OUT_FILES, []))
+        for row in rows:
+            if isinstance(row, dict):
+                records.append((evidence, cast(DiskFileRow, row)))
+    return records
+
+
+def _collect_network_records(network_artifacts: list[Any]) -> list[NetworkRecord]:
+    records: list[NetworkRecord] = []
+    for artifact in network_artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        art_map = cast(JsonMap, artifact)
+        evidence = _safe_str(art_map, C.OUT_EVIDENCE)
+        rows = _as_any_list(art_map.get(C.OUT_CONNECTIONS, []))
+        for row in rows:
+            if isinstance(row, dict):
+                records.append((evidence, cast(NetworkConnRow, row)))
+    return records
+
+
+def run_correlations(time_window_seconds: int = DEFAULT_TIME_WINDOW_SECONDS) -> None:
+    memory_artifacts = load_json_file(os.path.join(OUTDIR, C.OUT_MEMORY_ARTIFACTS), [])
+    disk_artifacts = load_json_file(os.path.join(OUTDIR, C.OUT_DISK_ARTIFACTS), [])
+    network_artifacts = load_json_file(os.path.join(OUTDIR, C.OUT_NETWORK_ARTIFACTS), [])
+
+    memory_list = _as_any_list(memory_artifacts)
+    disk_list = _as_any_list(disk_artifacts)
+    network_list = _as_any_list(network_artifacts)
+
+    process_records = _collect_process_records(memory_list)
+    socket_records = _collect_socket_records(memory_list)
+    disk_records = _collect_disk_records(disk_list)
+    net_records = _collect_network_records(network_list)
+
+    correlations: list[CorrelationRow] = []
+    correlations.extend(_build_process_correlations(process_records, disk_records, time_window_seconds))
+    correlations.extend(_build_fileless_correlations(socket_records, net_records))
+    write_json(os.path.join(OUTDIR, C.OUT_CORRELATIONS), correlations)
+
+
+def _build_process_correlations(
+    process_records: list[ProcessRecord],
+    disk_records: list[DiskRecord],
+    time_window_seconds: int,
+) -> list[ProcessCorrelation]:
+    output: list[ProcessCorrelation] = []
+    for mem_evi, proc_row in process_records:
+        proc_name = _safe_str(proc_row, C.OUT_PROCESS_NAME)
+        if not proc_name:
+            continue
+        for disk_evi, file_row in disk_records:
+            corr = _process_correlation_row(mem_evi, proc_row, disk_evi, file_row, time_window_seconds)
+            if corr:
+                output.append(corr)
+    return output
+
+
+def _process_correlation_row(
+    mem_evi: str,
+    proc_row: ProcessRow,
+    disk_evi: str,
+    file_row: DiskFileRow,
+    time_window_seconds: int,
+) -> ProcessCorrelation | None:
+    proc_name = _safe_str(proc_row, C.OUT_PROCESS_NAME)
+    file_name = _safe_str(file_row, C.OUT_FILE_NAME)
+    if _base_name(file_name) != _base_name(proc_name):
+        return None
+
+    proc_start = parse_timestamp(_safe_str(proc_row, C.OUT_START_TIME))
+    proc_image = _normalize_path(_safe_str(proc_row, C.OUT_IMAGE_PATH))
+    proc_cmd = _normalize_path(_safe_str(proc_row, C.OUT_COMMAND_LINE))
+    file_path = _normalize_path(_safe_str(file_row, C.OUT_FILE_PATH))
+
+    path_ok = bool(file_path) and (file_path == proc_image or file_path in proc_cmd)
+    file_time = _find_file_time(file_row)
+    time_ok = bool(proc_start is not None and file_time is not None and abs(proc_start - file_time) <= time_window_seconds)
+    strength, score = _match_strength(path_ok, time_ok)
+    uncertainty = _process_uncertainty(path_ok, time_ok)
+
+    process_evidence: ProcessEvidence = {C.OUT_MEMORY: mem_evi, C.OUT_DISK: disk_evi}
+    process_notes: ProcessNotes = {
+        C.OUT_PATH_MATCH: path_ok,
+        C.OUT_TIME_ALIGNED: time_ok,
+        C.OUT_UNCERTAINTY: uncertainty,
+    }
+
+    process_payload: ProcessRow = {
+        C.OUT_PID: str(proc_row.get(C.OUT_PID, C.KEY_EMPTY)),
+        C.OUT_PPID: str(proc_row.get(C.OUT_PPID, C.KEY_EMPTY)),
+        C.OUT_PROCESS_NAME: proc_name,
+        C.OUT_IMAGE_PATH: str(proc_row.get(C.OUT_IMAGE_PATH, C.KEY_EMPTY)),
+        C.OUT_COMMAND_LINE: str(proc_row.get(C.OUT_COMMAND_LINE, C.KEY_EMPTY)),
+        C.OUT_START_TIME: str(proc_row.get(C.OUT_START_TIME, C.KEY_EMPTY)),
+        C.OUT_PARENT_NAME: str(proc_row.get(C.OUT_PARENT_NAME, C.KEY_EMPTY)),
+    }
+
+    correlation: ProcessCorrelation = {
+        C.OUT_SCENARIO: C.SCENARIO_PROCESS,
+        C.OUT_MATCH_STRENGTH: strength,
+        C.OUT_CONFIDENCE_SCORE: score,
+        C.OUT_JOIN_KEYS: [C.JOIN_PROCESS_NAME],
+        C.OUT_EVIDENCE: process_evidence,
+        C.OUT_PROCESS: process_payload,
+        C.OUT_DISK_FILE: file_row,
+        C.OUT_NOTES: process_notes,
+        C.OUT_STATEMENT: C.STMT_PROCESS_TEMPLATE.format(proc=proc_name, path_ok=path_ok, time_ok=time_ok),
+    }
+    return correlation
+
+
+def _process_uncertainty(path_ok: bool, time_ok: bool) -> list[str]:
+    output: list[str] = []
+    if not path_ok:
+        output.append(C.NOTE_PATH_UNAVAILABLE)
+    if not time_ok:
+        output.append(C.NOTE_TIME_UNCONFIRMED)
+    return output
+
+
+def _build_fileless_correlations(
+    socket_records: list[SocketRecord],
+    net_records: list[NetworkRecord],
+) -> list[FilelessCorrelation]:
+    output: list[FilelessCorrelation] = []
+    for mem_evi, socket_row in socket_records:
+        mem_ip = _safe_str(socket_row, C.OUT_REMOTE_IP)
+        if not mem_ip:
+            continue
+        for net_evi, conn_row in net_records:
+            corr = _fileless_correlation_row(mem_evi, socket_row, net_evi, conn_row)
+            if corr:
+                output.append(corr)
+    return output
+
+
+def _fileless_correlation_row(
+    mem_evi: str,
+    socket_row: SocketRow,
+    net_evi: str,
+    conn_row: NetworkConnRow,
+) -> FilelessCorrelation | None:
+    mem_ip = _safe_str(socket_row, C.OUT_REMOTE_IP)
+    src_ip = _safe_str(conn_row, C.OUT_SRC_IP)
+    dst_ip = _safe_str(conn_row, C.OUT_DST_IP)
+    if mem_ip not in {src_ip, dst_ip}:
+        return None
+
+    mem_port = socket_row.get(C.OUT_REMOTE_PORT)
+    src_port = conn_row.get(C.IN_SRC_PORT)
+    dst_port = conn_row.get(C.IN_DST_PORT)
+    port_ok = mem_port is not None and mem_port in {src_port, dst_port}
+
+    proc_name = _safe_str(socket_row, C.OUT_PROCESS_NAME)
+    proc_ok = bool(proc_name)
+    strength, score = _match_strength(port_ok or proc_ok, False)
+    uncertainty = _fileless_uncertainty(port_ok, proc_ok)
+
+    fileless_evidence: FilelessEvidence = {C.OUT_MEMORY: mem_evi, C.OUT_NETWORK: net_evi}
+    fileless_notes: FilelessNotes = {
+        C.OUT_PORT_MATCH: port_ok,
+        C.OUT_PROCESS_ATTRIBUTED: proc_ok,
+        C.OUT_UNCERTAINTY: uncertainty,
+    }
+
+    correlation: FilelessCorrelation = {
+        C.OUT_SCENARIO: C.SCENARIO_FILELESS,
+        C.OUT_MATCH_STRENGTH: strength,
+        C.OUT_CONFIDENCE_SCORE: score,
+        C.OUT_JOIN_KEYS: [C.JOIN_REMOTE_IP],
+        C.OUT_EVIDENCE: fileless_evidence,
+        C.OUT_SOCKET: socket_row,
+        C.OUT_NETWORK_CONNECTION: conn_row,
+        C.OUT_NOTES: fileless_notes,
+        C.OUT_STATEMENT: C.STMT_FILELESS_TEMPLATE.format(
+            ip=mem_ip,
+            port_ok=port_ok,
+            proc=(proc_name or C.UNKNOWN_PROCESS),
+        ),
+    }
+    return correlation
+
+
+def _fileless_uncertainty(port_ok: bool, proc_ok: bool) -> list[str]:
+    output: list[str] = []
+    if not port_ok:
+        output.append(C.NOTE_IP_ONLY)
+    if not proc_ok:
+        output.append(C.NOTE_PROCESS_UNKNOWN)
+    return output
+
 
 def auto_triage(indir: str) -> None:
-    """Default end-to-end triage pipeline."""
+    ensure_runtime_dirs(OUTDIR, ERRDIR)
     scan_files(indir)
-    commonality()
-    ps_match(100)
-
-
-def run_playbook(playbook_path: str) -> None:
-    """Placeholder for playbook execution path."""
-    _ = playbook.NewPlaybook(playbook_path)
-
-
-def play(playbook_path: str) -> None:
-    """Backward-compatible wrapper for older call sites."""
-    run_playbook(playbook_path)
+    normalize_artifacts()
+    run_correlations()
 
 
 def main() -> None:
-    """CLI entrypoint."""
     ensure_runtime_dirs(OUTDIR, ERRDIR)
-
     if len(sys.argv) < 2:
-        print("Use: pixie <evidence_dir>")
+        print(C.MSG_USAGE)
         return
-
-    print("Analysing....")
-
+    print(C.MSG_ANALYSING)
     inpath = sys.argv[1]
     if not os.path.exists(inpath):
-        print(f"Input path does not exist: {inpath}")
+        print(C.MSG_INPUT_NOT_FOUND.format(path=inpath))
         return
-
-    if is_playbook_path(inpath):
-        run_playbook(inpath)
-        return
-
     auto_triage(inpath)
 
 
-if __name__ == "__main__":
+if __name__ == C.MAIN_GUARD:
     main()
