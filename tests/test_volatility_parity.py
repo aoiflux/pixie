@@ -1,12 +1,13 @@
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from volatility_adapter import VolatilityAdapter
 
 
-PLUGIN_FIXTURES = {
+PLUGIN_FIXTURES: dict[str, list[dict[str, Any]]] = {
     "windows.filescan": [
         {"Name": "\\Device\\HarddiskVolume1\\Windows\\System32\\cmd.exe"}
     ],
@@ -33,7 +34,7 @@ PLUGIN_FIXTURES = {
     ],
 }
 
-REQUIRED_KEYS = {
+REQUIRED_KEYS: dict[str, set[str]] = {
     "windows.filescan": {"Name"},
     "windows.psscan": {"PID", "ImageFileName", "CreateTime"},
     "windows.dlllist": {"PID", "Name", "Path", "LoadTime"},
@@ -42,7 +43,11 @@ REQUIRED_KEYS = {
 
 
 @pytest.mark.parametrize("plugin_name", sorted(PLUGIN_FIXTURES.keys()))
-def test_library_and_cli_json_shape_parity(monkeypatch, tmp_path, plugin_name):
+def test_library_and_cli_json_shape_parity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    plugin_name: str,
+) -> None:
     out_library = tmp_path / f"{plugin_name}.library.json"
     err_library = tmp_path / f"{plugin_name}.library.err"
     out_cli = tmp_path / f"{plugin_name}.cli.json"
@@ -52,7 +57,7 @@ def test_library_and_cli_json_shape_parity(monkeypatch, tmp_path, plugin_name):
 
     adapter_lib = VolatilityAdapter(prefer_library=True, enable_cli_fallback=False)
 
-    def fake_library(image_path, requested_plugin, out_path, err_path):
+    def fake_library(image_path: str, requested_plugin: str, out_path: str, err_path: str) -> None:
         assert requested_plugin == plugin_name
         Path(out_path).write_text(json.dumps(fixture), encoding="utf-8")
         Path(err_path).write_text("", encoding="utf-8")
@@ -63,7 +68,7 @@ def test_library_and_cli_json_shape_parity(monkeypatch, tmp_path, plugin_name):
 
     adapter_cli = VolatilityAdapter(prefer_library=False, enable_cli_fallback=True)
 
-    def fake_cli(image_path, requested_plugin, out_path, err_path):
+    def fake_cli(image_path: str, requested_plugin: str, out_path: str, err_path: str) -> None:
         assert requested_plugin == plugin_name
         Path(out_path).write_text(json.dumps(fixture), encoding="utf-8")
         Path(err_path).write_text("", encoding="utf-8")

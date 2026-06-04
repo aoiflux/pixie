@@ -741,24 +741,51 @@ def _fileless_uncertainty(port_ok: bool, proc_ok: bool) -> list[str]:
     return output
 
 
-def auto_triage(indir: str) -> None:
+def run(indir: str, include_correlations: bool = True) -> None:
     ensure_runtime_dirs(OUTDIR, ERRDIR)
     scan_files(indir)
     normalize_artifacts()
-    run_correlations()
+    if include_correlations:
+        run_correlations()
+
+
+def _parse_cli_args(argv: list[str]) -> tuple[str, bool] | None:
+    triage = False
+    inpaths: list[str] = []
+
+    for arg in argv[1:]:
+        if arg == C.CLI_TRIAGE:
+            triage = True
+            continue
+        if arg in {C.CLI_HELP, C.KEY_DASH_H}:
+            print(C.MSG_USAGE)
+            return None
+        if arg.startswith(C.KEY_DASH_DASH) or arg == C.KEY_DASH_H:
+            print(C.MSG_UNKNOWN_OPTION.format(option=arg))
+            print(C.MSG_USAGE)
+            return None
+        inpaths.append(arg)
+
+    if len(inpaths) != 1:
+        print(C.MSG_USAGE)
+        return None
+
+    return inpaths[0], triage
 
 
 def main() -> None:
     ensure_runtime_dirs(OUTDIR, ERRDIR)
-    if len(sys.argv) < 2:
-        print(C.MSG_USAGE)
+    parsed = _parse_cli_args(sys.argv)
+    if parsed is None:
         return
     print(C.MSG_ANALYSING)
-    inpath = sys.argv[1]
+    inpath, triage = parsed
     if not os.path.exists(inpath):
         print(C.MSG_INPUT_NOT_FOUND.format(path=inpath))
         return
-    auto_triage(inpath)
+    if not triage:
+        print(C.MSG_EXTRACT_ONLY)
+    run(inpath, include_correlations=triage)
 
 
 if __name__ == C.MAIN_GUARD:

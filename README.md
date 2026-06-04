@@ -134,7 +134,15 @@ python -m pip install -r requirements.txt
 
 ## Run
 
+To extract/normalize artifacts only and run correlation engine:
+
 From project root:
+
+```powershell
+python pixie.py --triage <evidence_dir>
+```
+
+To extract/normalize artifacts only and skip correlation generation:
 
 ```powershell
 python pixie.py <evidence_dir>

@@ -1,12 +1,13 @@
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from volatility_adapter import VolatilityAdapter
 
-PLUGIN_REQUIRED_KEYS = {
+PLUGIN_REQUIRED_KEYS: dict[str, set[str]] = {
     "windows.filescan": {"Name"},
     "windows.psscan": {"PID", "ImageFileName", "CreateTime"},
     "windows.dlllist": {"PID", "Name", "Path", "LoadTime"},
@@ -14,7 +15,7 @@ PLUGIN_REQUIRED_KEYS = {
 }
 
 
-def _shape_signature(rows: list[dict]) -> set[str]:
+def _shape_signature(rows: list[dict[str, Any]]) -> set[str]:
     keys = set()
     for row in rows:
         keys.update(row.keys())

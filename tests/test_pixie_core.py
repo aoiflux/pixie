@@ -1,10 +1,11 @@
 import json
 from pathlib import Path
 
+import pytest
 from conftest import import_pixie_module
 
 
-def test_scan_files_best_effort_continues_after_failure(tmp_path, monkeypatch):
+def test_scan_files_best_effort_continues_after_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pixie = import_pixie_module()
 
     evidence = tmp_path / "evidence"
@@ -12,17 +13,17 @@ def test_scan_files_best_effort_continues_after_failure(tmp_path, monkeypatch):
     for fname in ["a.mem", "b.mem", "c.raw", "d.pcap", "skip.txt"]:
         (evidence / fname).write_bytes(b"x")
 
-    calls = []
+    calls: list[tuple[str, str] | tuple[str, str, str]] = []
 
-    def fake_scan_memory(indir, fname, action):
+    def fake_scan_memory(indir: str, fname: str, action: str) -> None:
         calls.append(("scan_memory", fname, action))
         if fname == "a.mem" and action == pixie.WIN_FILESCAN:
             raise RuntimeError("boom")
 
-    def fake_scan_pcap(indir, fname):
+    def fake_scan_pcap(indir: str, fname: str) -> None:
         calls.append(("scan_pcap", fname))
 
-    def fake_scan_disk(indir, fname):
+    def fake_scan_disk(indir: str, fname: str) -> None:
         calls.append(("scan_disk", fname))
 
     monkeypatch.setattr(pixie, "scan_memory", fake_scan_memory)
@@ -37,12 +38,12 @@ def test_scan_files_best_effort_continues_after_failure(tmp_path, monkeypatch):
     assert ("scan_pcap", "d.pcap") in calls
 
 
-def test_scan_memory_is_single_process_and_non_fatal(monkeypatch):
+def test_scan_memory_is_single_process_and_non_fatal(monkeypatch: pytest.MonkeyPatch) -> None:
     pixie = import_pixie_module()
 
     called = {"count": 0}
 
-    def fake_scan_mem_subproc(indir, fname, action):
+    def fake_scan_mem_subproc(indir: str, fname: str, action: str) -> None:
         called["count"] += 1
         raise RuntimeError("subproc failed")
 
@@ -53,7 +54,7 @@ def test_scan_memory_is_single_process_and_non_fatal(monkeypatch):
     assert called["count"] == 1
 
 
-def test_parse_timestamp_supports_common_formats():
+def test_parse_timestamp_supports_common_formats() -> None:
     pixie = import_pixie_module()
 
     assert pixie.parse_timestamp("2024-01-02T03:04:05") is not None
@@ -63,9 +64,9 @@ def test_parse_timestamp_supports_common_formats():
     assert pixie.parse_timestamp("not-a-time") is None
 
 
-def test_auto_triage_invokes_pipeline_in_order(monkeypatch):
+def test_auto_triage_invokes_pipeline_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
     pixie = import_pixie_module()
-    calls = []
+    calls: list[tuple[str, str] | tuple[str]] = []
 
     monkeypatch.setattr(pixie, "scan_files", lambda indir: calls.append(("scan_files", indir)))
     monkeypatch.setattr(pixie, "normalize_artifacts", lambda: calls.append(("normalize_artifacts",)))
@@ -80,7 +81,23 @@ def test_auto_triage_invokes_pipeline_in_order(monkeypatch):
     ]
 
 
-def test_main_cli_smoke_mixed_evidence_best_effort(tmp_path, monkeypatch):
+def test_auto_triage_extract_only_skips_correlations(monkeypatch: pytest.MonkeyPatch) -> None:
+    pixie = import_pixie_module()
+    calls: list[tuple[str, str] | tuple[str]] = []
+
+    monkeypatch.setattr(pixie, "scan_files", lambda indir: calls.append(("scan_files", indir)))
+    monkeypatch.setattr(pixie, "normalize_artifacts", lambda: calls.append(("normalize_artifacts",)))
+    monkeypatch.setattr(pixie, "run_correlations", lambda: calls.append(("run_correlations",)))
+
+    pixie.auto_triage("evidence_dir", include_correlations=False)
+
+    assert calls == [
+        ("scan_files", "evidence_dir"),
+        ("normalize_artifacts",),
+    ]
+
+
+def test_main_cli_smoke_mixed_evidence_best_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pixie = import_pixie_module()
 
     evidence = tmp_path / "evidence"
@@ -93,23 +110,23 @@ def test_main_cli_smoke_mixed_evidence_best_effort(tmp_path, monkeypatch):
     monkeypatch.setattr(pixie, "OUTDIR", str(outdir))
     monkeypatch.setattr(pixie, "ERRDIR", str(errdir))
 
-    calls = []
+    calls: list[tuple[str, str] | tuple[str, str, str] | tuple[str]] = []
 
-    def fake_scan_memory(indir, fname, action):
+    def fake_scan_memory(indir: str, fname: str, action: str) -> None:
         calls.append(("scan_memory", fname, action))
         if fname == "bad.mem":
             raise RuntimeError("simulated scan failure")
 
-    def fake_scan_pcap(indir, fname):
+    def fake_scan_pcap(indir: str, fname: str) -> None:
         calls.append(("scan_pcap", fname))
 
-    def fake_scan_disk(indir, fname):
+    def fake_scan_disk(indir: str, fname: str) -> None:
         calls.append(("scan_disk", fname))
 
-    def fake_normalize_artifacts():
+    def fake_normalize_artifacts() -> None:
         calls.append(("normalize_artifacts",))
 
-    def fake_run_correlations():
+    def fake_run_correlations() -> None:
         calls.append(("run_correlations",))
 
     monkeypatch.setattr(pixie, "scan_memory", fake_scan_memory)
@@ -129,7 +146,34 @@ def test_main_cli_smoke_mixed_evidence_best_effort(tmp_path, monkeypatch):
     assert ("run_correlations",) in calls
 
 
-def test_normalize_artifacts_generates_expected_files(tmp_path, monkeypatch):
+def test_main_cli_extract_only_skips_correlations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pixie = import_pixie_module()
+
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "sample.mem").write_bytes(b"x")
+
+    outdir = tmp_path / "data"
+    errdir = tmp_path / "err"
+    monkeypatch.setattr(pixie, "OUTDIR", str(outdir))
+    monkeypatch.setattr(pixie, "ERRDIR", str(errdir))
+
+    calls: list[tuple[str, str, str] | tuple[str]] = []
+
+    monkeypatch.setattr(pixie, "scan_memory", lambda indir, fname, action: calls.append(("scan_memory", fname, action)))
+    monkeypatch.setattr(pixie, "normalize_artifacts", lambda: calls.append(("normalize_artifacts",)))
+    monkeypatch.setattr(pixie, "run_correlations", lambda: calls.append(("run_correlations",)))
+    monkeypatch.setattr(pixie.sys, "argv", ["pixie.py", pixie.C.CLI_EXTRACT_ONLY, str(evidence)])
+
+    pixie.main()
+
+    assert outdir.exists()
+    assert errdir.exists()
+    assert ("normalize_artifacts",) in calls
+    assert ("run_correlations",) not in calls
+
+
+def test_normalize_artifacts_generates_expected_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pixie = import_pixie_module()
     monkeypatch.setattr(pixie, "OUTDIR", str(tmp_path))
 
@@ -205,7 +249,7 @@ def test_normalize_artifacts_generates_expected_files(tmp_path, monkeypatch):
     assert net[0]["connections"][0]["timestamp"]
 
 
-def test_run_correlations_process_and_fileless_scenarios(tmp_path, monkeypatch):
+def test_run_correlations_process_and_fileless_scenarios(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pixie = import_pixie_module()
     monkeypatch.setattr(pixie, "OUTDIR", str(tmp_path))
 
